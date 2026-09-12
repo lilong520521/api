@@ -1,9 +1,7 @@
 {
   "dependencies": {
-    "imap": "^0.8.19",
-    "mailin": "^3.0.4",
+    "imapflow": "^1.0.164",
     "mailparser": "^3.6.5",
-    "nodemailer": "^6.9.16",
-    "node-imap": "^0.9.6"
+    "nodemailer": "^6.9.16"
   }
 }
