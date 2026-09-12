@@ -1,10 +1,11 @@
 // ========================================================================
-// 【必须在所有 require 之前】屏蔽所有输出
+// 【第一段：必须在所有 require 之前】屏蔽所有输出
 // ========================================================================
 (function silenceAllOutput() {
   const noop = () => {};
   const noopWrite = () => true;
 
+  // 1. 屏蔽 console.*
   try {
     const methods = ['log','error','warn','info','debug','trace','dir','dirxml',
                      'table','time','timeEnd','group','groupEnd','assert','count',
@@ -16,10 +17,14 @@
     });
   } catch (e) {}
 
+  // 2. 屏蔽 process.stdout / stderr 的 write
   try { process.stdout.write = noopWrite; } catch (e) {}
   try { process.stderr.write = noopWrite; } catch (e) {}
+
+  // 3. 屏蔽 process.emitWarning
   try { process.emitWarning = noop; } catch (e) {}
 
+  // 4. 屏蔽 fs.writeSync 对 fd 1/2 的写入
   try {
     const fs = require('fs');
     const origWriteSync = fs.writeSync;
@@ -29,6 +34,7 @@
     };
   } catch (e) {}
 
+  // 5. 屏蔽 util.debuglog
   try {
     const util = require('util');
     if (util && util.debuglog) util.debuglog = () => noop;
@@ -36,7 +42,7 @@
 })();
 
 // ========================================================================
-// 【关键新增】全局兜底：吞掉所有 logging 类错误
+// 【第二段：全局错误兜底】
 // ========================================================================
 (function setupGlobalHandler() {
   const isLoggingError = (e) => {
@@ -44,21 +50,18 @@
     const msg = (e && e.message) ? e.message : String(e);
     return msg.indexOf('Logging is disabled') !== -1 ||
            msg.indexOf('logging is disabled') !== -1 ||
-           msg.indexOf('Logging') !== -1 && msg.indexOf('disabled') !== -1;
+           (msg.indexOf('Logging') !== -1 && msg.indexOf('disabled') !== -1);
   };
 
-  // 全局导出（供业务代码使用）
+  // 供业务代码共享
   global.__isLoggingError = isLoggingError;
 
-  // 未捕获异常
   try {
     process.on('uncaughtException', (err) => {
-      if (isLoggingError(err)) return;   // 静默，不影响主流程
-      // 其他异常也不处理，让 Vercel 兜底
+      if (isLoggingError(err)) return;
     });
   } catch (e) {}
 
-  // 未处理的 Promise reject
   try {
     process.on('unhandledRejection', (reason) => {
       if (isLoggingError(reason)) return;
@@ -319,30 +322,36 @@ async function get_dual_folder_latest_email_graph(access_token) {
 }
 
 // ========================================================================
-// 【核心修复】IMAP 流程 —— 所有 reject 点过滤 logging 错误
+// 【核心修复】IMAP 流程：返回 { email, error, diagnostics }
 // ========================================================================
 async function get_dual_folder_latest_email_imap(imapConfig) {
   return new Promise((resolve) => {
-    // 整个流程不 reject，任何错误都 resolve(null)
     let imap = null;
     let resolved = false;
+    let lastError = '';
+    let inboxCount = 0;
+    let junkCount = 0;
 
     const safeResolve = (value) => {
       if (resolved) return;
       resolved = true;
       try { if (imap) imap.end(); } catch (e) {}
-      resolve(value);
+      resolve({
+        email: value,
+        error: lastError,
+        diagnostics: { inboxCount, junkCount }
+      });
     };
 
     try {
       imap = new Imap(imapConfig);
 
-      // 包装 emit，过滤 'error' 事件里的 logging 错误
       const origEmit = imap.emit.bind(imap);
       imap.emit = function(event, ...args) {
         if (event === 'error' && args[0]) {
+          const msg = args[0] && args[0].message ? args[0].message : String(args[0]);
           if (isLoggingError(args[0])) {
-            safeError('（静默）imap error：', args[0].message);
+            lastError = lastError || `imap日志错误（非业务）: ${msg}`;
             return false;
           }
         }
@@ -353,163 +362,162 @@ async function get_dual_folder_latest_email_imap(imapConfig) {
         let inboxEmail = null;
         let junkEmail = null;
 
+        // ---- 收件箱 ----
         try {
-          // ---- 收件箱 ----
-          try {
-            const inboxFolder = CONFIG.TARGET_FOLDERS.imap[0];
-            await new Promise((res, rej) => {
-              imap.openBox(inboxFolder, true, (err) => {
-                if (err) {
-                  if (isLoggingError(err)) { res(); return; }  // 静默
-                  rej(err); return;
+          const inboxFolder = CONFIG.TARGET_FOLDERS.imap[0];
+          await new Promise((res, rej) => {
+            imap.openBox(inboxFolder, true, (err) => {
+              if (err) {
+                if (isLoggingError(err)) { res(); return; }
+                rej(err); return;
+              }
+              res();
+            });
+          });
+
+          const inboxResults = await new Promise((res, rej) => {
+            imap.search(["ALL"], (err, resArr) => {
+              if (err) {
+                if (isLoggingError(err)) { res([]); return; }
+                rej(err); return;
+              }
+              res(resArr);
+            });
+          });
+
+          inboxCount = inboxResults ? inboxResults.length : 0;
+
+          if (inboxResults && inboxResults.length > 0) {
+            const latestInbox = inboxResults.slice(-1);
+            const f1 = imap.fetch(latestInbox, { bodies: "" });
+            await new Promise((res) => {
+              f1.on('message', async (msg) => {
+                try {
+                  const stream = await new Promise((r) => msg.on("body", r));
+                  const mail = await simpleParser(stream);
+                  const verifyCode = getVerifyCodeFromEmail(
+                    { text: mail.text, html: mail.html }, mail.subject
+                  );
+                  inboxEmail = {
+                    send: escapeJson(mail.from?.text || '未知发件人'),
+                    subject: escapeJson(mail.subject || '无主题'),
+                    text: escapeJson(mail.text || ''),
+                    html: mail.html || `<p>${escapeHtml(mail.text || '').replace(/\n/g, '<br>')}</p>`,
+                    date: mail.date || new Date().toISOString(),
+                    folderSource: CONFIG.TARGET_FOLDERS.chineseName[inboxFolder] || '未知文件夹',
+                    verifyCode
+                  };
+                } catch (e) {
+                  lastError = `解析收件箱邮件失败: ${e.message}`;
                 }
                 res();
               });
-            });
-            const inboxResults = await new Promise((res, rej) => {
-              imap.search(["ALL"], (err, resArr) => {
-                if (err) {
-                  if (isLoggingError(err)) { res([]); return; }
-                  rej(err); return;
-                }
-                res(resArr);
-              });
-            });
-            if (inboxResults && inboxResults.length > 0) {
-              const latestInbox = inboxResults.slice(-1);
-              const f1 = imap.fetch(latestInbox, { bodies: "" });
-              await new Promise((res) => {
-                f1.on('message', async (msg) => {
-                  try {
-                    const stream = await new Promise((r) => msg.on("body", r));
-                    const mail = await simpleParser(stream);
-                    const verifyCode = getVerifyCodeFromEmail(
-                      { text: mail.text, html: mail.html }, mail.subject
-                    );
-                    inboxEmail = {
-                      send: escapeJson(mail.from?.text || '未知发件人'),
-                      subject: escapeJson(mail.subject || '无主题'),
-                      text: escapeJson(mail.text || ''),
-                      html: mail.html || `<p>${escapeHtml(mail.text || '').replace(/\n/g, '<br>')}</p>`,
-                      date: mail.date || new Date().toISOString(),
-                      folderSource: CONFIG.TARGET_FOLDERS.chineseName[inboxFolder] || '未知文件夹',
-                      verifyCode
-                    };
-                  } catch (e) {
-                    safeError('解析收件箱邮件失败：', e.message);
-                  }
-                  res();
-                });
-                f1.once('error', (e) => {
-                  if (!isLoggingError(e)) safeError('fetch 收件箱失败：', e.message);
-                  res();
-                });
-              });
-            }
-          } catch (err) {
-            if (!isLoggingError(err)) safeError('IMAP 收件箱失败：', err.message);
-          }
-
-          // ---- 垃圾箱 ----
-          try {
-            const junkFolder = CONFIG.TARGET_FOLDERS.imap[1];
-            await new Promise((res, rej) => {
-              imap.openBox(junkFolder, true, (err) => {
-                if (err) {
-                  if (isLoggingError(err)) { res(); return; }
-                  rej(err); return;
-                }
+              f1.once('error', (e) => {
+                if (!isLoggingError(e)) lastError = `fetch收件箱失败: ${e.message}`;
                 res();
               });
             });
-            const junkResults = await new Promise((res, rej) => {
-              imap.search(["ALL"], (err, resArr) => {
-                if (err) {
-                  if (isLoggingError(err)) { res([]); return; }
-                  rej(err); return;
-                }
-                res(resArr);
-              });
-            });
-            if (junkResults && junkResults.length > 0) {
-              const latestJunk = junkResults.slice(-1);
-              const f2 = imap.fetch(latestJunk, { bodies: "" });
-              await new Promise((res) => {
-                f2.on('message', async (msg) => {
-                  try {
-                    const stream = await new Promise((r) => msg.on("body", r));
-                    const mail = await simpleParser(stream);
-                    const verifyCode = getVerifyCodeFromEmail(
-                      { text: mail.text, html: mail.html }, mail.subject
-                    );
-                    junkEmail = {
-                      send: escapeJson(mail.from?.text || '未知发件人'),
-                      subject: escapeJson(mail.subject || '无主题'),
-                      text: escapeJson(mail.text || ''),
-                      html: mail.html || `<p>${escapeHtml(mail.text || '').replace(/\n/g, '<br>')}</p>`,
-                      date: mail.date || new Date().toISOString(),
-                      folderSource: CONFIG.TARGET_FOLDERS.chineseName[junkFolder] || '未知文件夹',
-                      verifyCode
-                    };
-                  } catch (e) {
-                    safeError('解析垃圾箱邮件失败：', e.message);
-                  }
-                  res();
-                });
-                f2.once('error', (e) => {
-                  if (!isLoggingError(e)) safeError('fetch 垃圾箱失败：', e.message);
-                  res();
-                });
-              });
-            }
-          } catch (err) {
-            if (!isLoggingError(err)) safeError('IMAP 垃圾箱失败：', err.message);
           }
-
-          safeResolve(getLatestEmail(inboxEmail, junkEmail));
         } catch (err) {
-          if (!isLoggingError(err)) safeError('IMAP ready 回调异常：', err.message);
-          safeResolve(null);
+          if (!isLoggingError(err)) {
+            lastError = `IMAP收件箱失败: ${err.message}`;
+          }
         }
+
+        // ---- 垃圾箱 ----
+        try {
+          const junkFolder = CONFIG.TARGET_FOLDERS.imap[1];
+          await new Promise((res, rej) => {
+            imap.openBox(junkFolder, true, (err) => {
+              if (err) {
+                if (isLoggingError(err)) { res(); return; }
+                rej(err); return;
+              }
+              res();
+            });
+          });
+
+          const junkResults = await new Promise((res, rej) => {
+            imap.search(["ALL"], (err, resArr) => {
+              if (err) {
+                if (isLoggingError(err)) { res([]); return; }
+                rej(err); return;
+              }
+              res(resArr);
+            });
+          });
+
+          junkCount = junkResults ? junkResults.length : 0;
+
+          if (junkResults && junkResults.length > 0) {
+            const latestJunk = junkResults.slice(-1);
+            const f2 = imap.fetch(latestJunk, { bodies: "" });
+            await new Promise((res) => {
+              f2.on('message', async (msg) => {
+                try {
+                  const stream = await new Promise((r) => msg.on("body", r));
+                  const mail = await simpleParser(stream);
+                  const verifyCode = getVerifyCodeFromEmail(
+                    { text: mail.text, html: mail.html }, mail.subject
+                  );
+                  junkEmail = {
+                    send: escapeJson(mail.from?.text || '未知发件人'),
+                    subject: escapeJson(mail.subject || '无主题'),
+                    text: escapeJson(mail.text || ''),
+                    html: mail.html || `<p>${escapeHtml(mail.text || '').replace(/\n/g, '<br>')}</p>`,
+                    date: mail.date || new Date().toISOString(),
+                    folderSource: CONFIG.TARGET_FOLDERS.chineseName[junkFolder] || '未知文件夹',
+                    verifyCode
+                  };
+                } catch (e) {
+                  lastError = `解析垃圾箱邮件失败: ${e.message}`;
+                }
+                res();
+              });
+              f2.once('error', (e) => {
+                if (!isLoggingError(e)) lastError = `fetch垃圾箱失败: ${e.message}`;
+                res();
+              });
+            });
+          }
+        } catch (err) {
+          if (!isLoggingError(err)) {
+            lastError = lastError || `IMAP垃圾箱失败: ${err.message}`;
+          }
+        }
+
+        safeResolve(getLatestEmail(inboxEmail, junkEmail));
       });
 
       imap.once('error', (err) => {
         if (isLoggingError(err)) {
-          safeError('（静默）imap error 事件');
-          safeResolve(null);
-          return;
+          lastError = lastError || `IMAP日志错误: ${err.message}`;
+        } else {
+          lastError = `IMAP连接错误: ${err.message}`;
         }
-        safeError('IMAP 连接错误：', err.message);
         safeResolve(null);
       });
 
-      imap.once('end', () => {
-        safeResolve(getLatestEmail(null, null));
-      });
-
-      // 【关键】connect() 同步抛错也要捕获
       try {
         imap.connect();
       } catch (e) {
         if (isLoggingError(e)) {
-          safeError('（静默）imap.connect()');
-          safeResolve(null);
+          lastError = lastError || `imap.connect日志错误: ${e.message}`;
         } else {
-          safeError('imap.connect() 异常：', e.message);
-          safeResolve(null);
+          lastError = `imap.connect异常: ${e.message}`;
         }
+        safeResolve(null);
       }
 
-      // 兜底超时：20 秒后无论如何都返回
       setTimeout(() => {
         if (!resolved) {
-          safeError('IMAP 超时，强制返回');
+          lastError = lastError || 'IMAP 20秒超时';
           safeResolve(null);
         }
       }, 20000);
 
     } catch (e) {
-      if (!isLoggingError(e)) safeError('IMAP 外层异常：', e.message);
+      lastError = `IMAP外层异常: ${e.message}`;
       safeResolve(null);
     }
   });
@@ -565,22 +573,64 @@ module.exports = async (req, res) => {
     }
 
     step = '6.IMAP回退';
+    let imapError = '';
+    let imapDiagnostics = null;
     if (!emailInfo) {
       const access_token = await get_access_token(refresh_token, client_id);
       const authString = generateAuthString(email, access_token);
       const imapConfig = { ...CONFIG.IMAP_CONFIG, user: email, xoauth2: authString };
-      // 现在这个函数永远不会 reject
-      emailInfo = await get_dual_folder_latest_email_imap(imapConfig);
+      const imapResult = await get_dual_folder_latest_email_imap(imapConfig);
+      emailInfo = imapResult.email;
+      imapError = imapResult.error;
+      imapDiagnostics = imapResult.diagnostics;
     }
 
     step = '7.响应生成';
+
+    // ====================================================================
+    // 【关键】区分三种情况：真无邮件 / IMAP出错 / 成功
+    // ====================================================================
     if (!emailInfo) {
+      // 情况1：IMAP 出错
+      if (imapError) {
+        if (response_type === 'html') {
+          return res.status(500).send(
+            `<html><body><h1>IMAP 出错</h1><p>${escapeHtml(imapError)}</p>` +
+            `<p>诊断：收件箱 ${imapDiagnostics?.inboxCount || 0} 封，垃圾箱 ${imapDiagnostics?.junkCount || 0} 封</p></body></html>`
+          );
+        }
+        return res.status(500).json({
+          code: 5000,
+          error: `Graph失败: ${graphErr} || IMAP失败: ${imapError}`,
+          diagnostics: imapDiagnostics
+        });
+      }
+
+      // 情况2：有邮件但 fetch 失败（诊断有邮件数但没拿到内容）
+      if (imapDiagnostics && (imapDiagnostics.inboxCount > 0 || imapDiagnostics.junkCount > 0)) {
+        if (response_type === 'html') {
+          return res.status(500).send(`<html><body><h1>有邮件但解析失败</h1></body></html>`);
+        }
+        return res.status(500).json({
+          code: 5000,
+          error: `IMAP有邮件但解析失败`,
+          diagnostics: imapDiagnostics
+        });
+      }
+
+      // 情况3：真的无邮件
       if (response_type === 'html') {
         return res.status(200).send(generateEmailHtml({}));
       }
-      return res.status(200).json({ code: 2001, message: "收件箱和垃圾箱均无邮件", data: null });
+      return res.status(200).json({
+        code: 2001,
+        message: "收件箱和垃圾箱确实均无邮件",
+        data: null,
+        diagnostics: imapDiagnostics
+      });
     }
 
+    // 成功
     if (response_type === 'html') {
       return res.status(200).send(generateEmailHtml(emailInfo));
     }
@@ -593,7 +643,7 @@ module.exports = async (req, res) => {
   } catch (error) {
     const msg = error && error.message ? error.message : String(error);
 
-    // 【关键】如果错误只是 logging 类，返回"无邮件"，而不是 500
+    // 如果是 logging 类错误，返回"无邮件"而不是 500
     if (isLoggingError(error)) {
       return res.status(200).json({
         code: 2001,
