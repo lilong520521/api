@@ -1,4 +1,7 @@
 {
+  "engines": {
+    "node": "18.x"
+  },
   "dependencies": {
     "imapflow": "^1.0.164",
     "mailparser": "^3.6.5",
