@@ -1,38 +1,54 @@
 // ========================================================================
-// 【必须在所有 require 之前】屏蔽 Vercel 日志拦截器抛出的
-// "Logging is disabled on this server" 异常
-// ==========================================================================
-(function silenceLogging() {
+// 【必须在所有 require 之前】彻底屏蔽所有输出
+// ========================================================================
+(function silenceAllOutput() {
   const noop = () => {};
-  const noopWrite = function () { return true; };
+  const noopWrite = () => true;
 
-  // 1. console.* 全屏蔽
-  ['log', 'error', 'warn', 'info', 'debug', 'trace'].forEach(m => {
-    try { console[m] = noop; } catch (e) {
-      try { Object.defineProperty(console, m, { value: noop, writable: true, configurable: true }); } catch (e2) {}
-    }
-  });
+  // 1. 屏蔽 console.*（全部方法）
+  try {
+    const methods = ['log','error','warn','info','debug','trace','dir','dirxml',
+                     'table','time','timeEnd','group','groupEnd','assert','count',
+                     'countReset','clear'];
+    methods.forEach(m => {
+      try { console[m] = noop; } catch (e) {
+        try { Object.defineProperty(console, m, { value: noop, writable: true, configurable: true }); } catch (e2) {}
+      }
+    });
+  } catch (e) {}
 
-  // 2. 【关键】屏蔽底层 stdout / stderr —— Vercel 拦截器在这里
+  // 2. 屏蔽 process.stdout / stderr 的 write
   try { process.stdout.write = noopWrite; } catch (e) {}
   try { process.stderr.write = noopWrite; } catch (e) {}
 
   // 3. 屏蔽 process.emitWarning
   try { process.emitWarning = noop; } catch (e) {}
-})();
 
+  // 4. 【关键】屏蔽 fs.writeSync 对 fd 1/2（stdout/stderr）的写入
+  // 有些库会绕过 process.stdout 直接用 fs 写文件描述符
+  try {
+    const fs = require('fs');
+    const origWriteSync = fs.writeSync;
+    fs.writeSync = function(fd, ...args) {
+      if (fd === 1 || fd === 2) return 0;  // 静默
+      return origWriteSync.apply(this, [fd, ...args]);
+    };
+  } catch (e) {}
+
+  // 5. 屏蔽 util.debuglog（Node 内部模块用）
+  try {
+    const util = require('util');
+    if (util && util.debuglog) util.debuglog = () => noop;
+  } catch (e) {}
+})();
 // ========================================================================
 
 const Imap = require('node-imap');
 const simpleParser = require("mailparser").simpleParser;
 
-// ===================== 安全日志（双保险）=====================
-function safeLog(...args) {
-  try { console.log(...args); } catch (e) {}
-}
-function safeError(...args) {
-  try { console.error(...args); } catch (e) {}
-}
+// ===================== 安全日志 =====================
+function safeLog(...args) { try { console.log(...args); } catch (e) {} }
+function safeError(...args) { try { console.error(...args); } catch (e) {} }
 
 // ===================== 全局配置 =====================
 const CONFIG = {
@@ -82,12 +98,8 @@ async function fetchWithTimeout(url, options = {}, timeout = CONFIG.REQUEST_TIME
 
 function escapeHtml(str) {
   if (!str) return '';
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 }
 
 function escapeJson(str) {
@@ -118,8 +130,7 @@ function preprocessText(rawText) {
   const withoutHtml = rawText.replace(/<[^>]+>/g, '');
   const mergeDigitSeparators = withoutHtml.replace(/(\d)[\s-_]+(\d)/g, '$1$2');
   const cleanSpecialChars = mergeDigitSeparators.replace(/[^\u4e00-\u9fa5a-zA-Z0-9，。：！？]/g, '');
-  const normalized = cleanSpecialChars.replace(/\s+/g, ' ').trim();
-  return normalized.toLowerCase();
+  return cleanSpecialChars.replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
 const VERIFY_CODE_RULES = [
@@ -134,7 +145,6 @@ const VERIFY_CODE_RULES = [
 function extractVerifyCode(text) {
   const cleanText = preprocessText(text);
   if (!cleanText) return { code: '', rule: '无有效文本', confidence: 0 };
-
   const matchedResults = [];
   for (const rule of VERIFY_CODE_RULES) {
     const matches = cleanText.match(rule.regex);
@@ -148,96 +158,60 @@ function extractVerifyCode(text) {
       }
     }
   }
-
   if (matchedResults.length === 0) return { code: '', rule: '无匹配规则', confidence: 0 };
-
   const uniqueResults = Array.from(new Map(matchedResults.map(item => [item.code, item])).values());
   uniqueResults.sort((a, b) => b.confidence - a.confidence);
   return uniqueResults[0];
 }
 
-function extractVerifyCodeWithLog(text, emailSubject = '未知主题') {
-  const result = extractVerifyCode(text);
-  safeLog(`【6位验证码提取】主题：${emailSubject} | 验证码：${result.code} | 规则：${result.rule} | 置信度：${result.confidence}`);
-  return result;
-}
-
 function getVerifyCodeFromEmail(emailData, emailSubject = '未知主题') {
   const targetText = emailData.text || emailData.html || '';
-  return extractVerifyCodeWithLog(targetText, emailSubject);
+  const result = extractVerifyCode(targetText);
+  safeLog(`【验证码】主题：${emailSubject} | 验证码：${result.code} | 规则：${result.rule}`);
+  return result;
 }
 
 // ===================== HTML 生成 =====================
 function generateEmailHtml(emailData) {
-  const { send, subject, text, html: emailHtml, date, folderSource, verifyCode } = emailData;
+  const { send, subject, text, html: emailHtml, date, folderSource, verifyCode } = emailData || {};
   const escapedText = escapeHtml(text || '');
   const escapedHtml = emailHtml || `<p>${escapedText.replace(/\n/g, '<br>')}</p>`;
   const folderCN = folderSource || '未知文件夹';
   const codeDisplay = verifyCode && verifyCode.code
-    ? `<span style="color: #e53e3e; font-weight: bold; font-size: 1.2em;">${verifyCode.code}</span>（规则：${verifyCode.rule}，置信度：${verifyCode.confidence}%）`
+    ? `<span style="color: #e53e3e; font-weight: bold; font-size: 1.2em;">${verifyCode.code}</span>`
     : '未提取到6位验证码';
 
-  return `
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-      <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>${escapeHtml(subject || '无主题邮件')}</title>
-        <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; line-height: 1.6; margin: 0; padding: 20px; background: #f5f5f5; }
-          .email-container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-          .email-header { margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid #eee; }
-          .email-title { margin: 0 0 15px; color: #2d3748; }
-          .email-meta { color: #4a5568; font-size: 0.9em; }
-          .email-meta span { display: block; margin-bottom: 5px; }
-          .email-content { color: #1a202c; }
-          .folder-source { color: #718096; font-style: italic; }
-          .verify-code { margin-top: 10px; padding: 10px; background: #fef7fb; border-left: 3px solid #e53e3e; }
-        </style>
-      </head>
-      <body>
-        <div class="email-container">
-          <div class="email-header">
-            <h1 class="email-title">${escapeHtml(subject || '无主题')}</h1>
-            <div class="email-meta">
-              <span><strong>发件人：</strong>${escapeHtml(send || '未知发件人')}</span>
-              <span><strong>发送日期：</strong>${new Date(date).toLocaleString() || '未知日期'}</span>
-              <span class="folder-source"><strong>来源文件夹：</strong>${escapeHtml(folderCN)}</span>
-              <div class="verify-code"><strong>提取的6位验证码：</strong>${codeDisplay}</div>
-            </div>
-          </div>
-          <div class="email-content">${escapedHtml}</div>
-        </div>
-      </body>
-    </html>
-  `;
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>${escapeHtml(subject || '无主题')}</title>
+    <style>body{font-family:-apple-system,sans-serif;line-height:1.6;padding:20px;background:#f5f5f5}
+    .c{max-width:800px;margin:0 auto;background:#fff;padding:30px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.1)}
+    .h{margin-bottom:20px;padding-bottom:15px;border-bottom:1px solid #eee}
+    .vc{margin-top:10px;padding:10px;background:#fef7fb;border-left:3px solid #e53e3e}</style></head>
+    <body><div class="c"><div class="h"><h1>${escapeHtml(subject || '无主题')}</h1>
+    <p>发件人：${escapeHtml(send || '未知')}</p>
+    <p>日期：${date ? new Date(date).toLocaleString() : '未知'}</p>
+    <p>来源：${escapeHtml(folderCN)}</p>
+    <div class="vc"><strong>验证码：</strong>${codeDisplay}</div></div>
+    <div>${escapedHtml}</div></div></body></html>`;
 }
 
 // ===================== 核心业务 =====================
-// IMAP token（不传 scope，与 Go 版一致）
 async function get_access_token(refresh_token, client_id) {
-  try {
-    const response = await fetchWithTimeout(CONFIG.OAUTH_TOKEN_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        'client_id': client_id,
-        'grant_type': 'refresh_token',
-        'refresh_token': refresh_token
-      }).toString()
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`HTTP错误！状态码：${response.status}，响应：${errorText}`);
-    }
-
-    const data = await response.json();
-    return data.access_token;
-  } catch (error) {
-    throw new Error(`获取access_token失败：${error.message}`);
+  const response = await fetchWithTimeout(CONFIG.OAUTH_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      'client_id': client_id,
+      'grant_type': 'refresh_token',
+      'refresh_token': refresh_token
+      // 👈 不传 scope，与 Go 版一致
+    }).toString()
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`HTTP错误！状态码：${response.status}，响应：${errorText}`);
   }
+  const data = await response.json();
+  return data.access_token;
 }
 
 const generateAuthString = (user, accessToken) => {
@@ -245,7 +219,7 @@ const generateAuthString = (user, accessToken) => {
   return Buffer.from(authString).toString('base64');
 };
 
-// Graph token 探活：与 Go 版一致 —— 同时接受 Mail.Read 和 Mail.ReadWrite
+// Graph 探活：与 Go 版一致，同时接受 Mail.Read / Mail.ReadWrite
 async function graph_api(refresh_token, client_id) {
   try {
     const response = await fetchWithTimeout(CONFIG.OAUTH_TOKEN_URL, {
@@ -258,32 +232,22 @@ async function graph_api(refresh_token, client_id) {
         'scope': 'https://graph.microsoft.com/.default'
       }).toString()
     });
-
     if (!response.ok) {
-      const errorText = await response.text();
-      safeError('Graph token 请求失败：', response.status, errorText);
       return { access_token: '', status: false, error: `Graph token 请求失败：${response.status}` };
     }
-
     const data = await response.json();
     const scopeStr = data.scope || '';
-    safeLog('Graph token scope:', scopeStr);
-
-    // 关键修复：同时接受 Mail.Read 和 Mail.ReadWrite；scope 为空也放过
     const hasMailPermission =
       scopeStr === '' ||
       scopeStr.indexOf('https://graph.microsoft.com/Mail.ReadWrite') !== -1 ||
       scopeStr.indexOf('https://graph.microsoft.com/Mail.Read') !== -1;
-
     return {
       access_token: data.access_token || '',
       status: hasMailPermission,
-      error: hasMailPermission ? '' : `scope 未含 Mail 权限：${scopeStr}`
+      error: hasMailPermission ? '' : `scope 未含 Graph Mail 权限`
     };
   } catch (error) {
-    const msg = error && error.message ? error.message : String(error);
-    safeError('Graph API权限检查失败：', msg);
-    return { access_token: '', status: false, error: msg };
+    return { access_token: '', status: false, error: error.message || String(error) };
   }
 }
 
@@ -292,26 +256,16 @@ async function get_single_folder_email(access_token, mailbox) {
     const url = `${CONFIG.GRAPH_API_BASE_URL}/${mailbox}/messages?$top=1&$orderby=receivedDateTime desc`;
     const response = await fetchWithTimeout(url, {
       method: 'GET',
-      headers: {
-        'Content-Type': 'application/json',
-        "Authorization": `Bearer ${access_token}`
-      },
+      headers: { 'Content-Type': 'application/json', "Authorization": `Bearer ${access_token}` }
     });
-
-    if (!response.ok) {
-      safeError(`文件夹${mailbox}访问失败，状态码：${response.status}`);
-      return null;
-    }
-
-    const responseData = await response.json();
-    const email = responseData.value?.[0];
+    if (!response.ok) return null;
+    const data = await response.json();
+    const email = data.value?.[0];
     if (!email) return null;
-
     const verifyCode = getVerifyCodeFromEmail(
       { text: email['bodyPreview'], html: email['body']?.['content'] },
       email['subject']
     );
-
     return {
       send: email['from']?.['emailAddress']?.['address'] || '未知发件人',
       subject: email['subject'] || '无主题',
@@ -322,7 +276,6 @@ async function get_single_folder_email(access_token, mailbox) {
       verifyCode
     };
   } catch (error) {
-    safeError(`获取${mailbox}邮件失败：`, error && error.message ? error.message : String(error));
     return null;
   }
 }
@@ -335,10 +288,33 @@ async function get_dual_folder_latest_email_graph(access_token) {
   return getLatestEmail(inboxEmail, junkEmail);
 }
 
+// ===================== IMAP（关键修复点）=====================
 async function get_dual_folder_latest_email_imap(imapConfig) {
   const imap = new Imap(imapConfig);
   let inboxEmail = null;
   let junkEmail = null;
+
+  // ====================================================================
+  // 【关键】包装 imap.emit，过滤掉 "Logging is disabled" 错误
+  // node-imap 内部打日志时会触发 Vercel 拦截，抛出的错误被
+  // EventEmitter 冒泡成 'error' 事件。这里直接吞掉它，
+  // 让 IMAP 连接继续正常走完流程。
+  // ====================================================================
+  const origEmit = imap.emit.bind(imap);
+  imap.emit = function(event, ...args) {
+    if (event === 'error' && args[0]) {
+      const err = args[0];
+      const msg = (err && err.message) ? err.message : String(err);
+      if (msg.includes('Logging is disabled') ||
+          msg.includes('logging is disabled') ||
+          msg.includes('logging')) {
+        // 完全静默，不把它当做错误
+        safeError('（已静默）imap 内部日志错误：', msg);
+        return false;
+      }
+    }
+    return origEmit(event, ...args);
+  };
 
   const fetchEmails = new Promise((resolve, reject) => {
     imap.once('ready', async () => {
@@ -360,8 +336,7 @@ async function get_dual_folder_latest_email_imap(imapConfig) {
                 const stream = await new Promise((r) => msg.on("body", r));
                 const mail = await simpleParser(stream);
                 const verifyCode = getVerifyCodeFromEmail(
-                  { text: mail.text, html: mail.html },
-                  mail.subject
+                  { text: mail.text, html: mail.html }, mail.subject
                 );
                 inboxEmail = {
                   send: escapeJson(mail.from?.text || '未知发件人'),
@@ -377,7 +352,7 @@ async function get_dual_folder_latest_email_imap(imapConfig) {
             });
           }
         } catch (err) {
-          safeError('IMAP获取收件箱邮件失败：', err && err.message ? err.message : String(err));
+          safeError('IMAP 收件箱失败：', err && err.message);
         }
 
         // 2. 垃圾箱
@@ -397,8 +372,7 @@ async function get_dual_folder_latest_email_imap(imapConfig) {
                 const stream = await new Promise((r) => msg.on("body", r));
                 const mail = await simpleParser(stream);
                 const verifyCode = getVerifyCodeFromEmail(
-                  { text: mail.text, html: mail.html },
-                  mail.subject
+                  { text: mail.text, html: mail.html }, mail.subject
                 );
                 junkEmail = {
                   send: escapeJson(mail.from?.text || '未知发件人'),
@@ -414,7 +388,7 @@ async function get_dual_folder_latest_email_imap(imapConfig) {
             });
           }
         } catch (err) {
-          safeError('IMAP获取垃圾箱邮件失败：', err && err.message ? err.message : String(err));
+          safeError('IMAP 垃圾箱失败：', err && err.message);
         }
 
         imap.end();
@@ -425,7 +399,17 @@ async function get_dual_folder_latest_email_imap(imapConfig) {
       }
     });
 
-    imap.once('error', (err) => reject(err));
+    imap.once('error', (err) => {
+      // 二次过滤：这里的 err 如果也是 "Logging is disabled"，静默处理
+      const msg = (err && err.message) ? err.message : String(err);
+      if (msg.includes('Logging is disabled')) {
+        safeError('（已静默）imap error 事件：', msg);
+        resolve(null);  // 直接返回 null 而不是 reject
+        return;
+      }
+      reject(err);
+    });
+
     imap.connect();
   });
 
@@ -434,72 +418,56 @@ async function get_dual_folder_latest_email_imap(imapConfig) {
 
 // ===================== 主入口 =====================
 module.exports = async (req, res) => {
-  // ---- 关键：运行时再屏蔽一次（防止 Vercel 在函数入口重写 process）----
+  // 运行时再屏蔽一次
   try {
     const noop = () => {};
     try { process.stdout.write = function() { return true; }; } catch (e) {}
     try { process.stderr.write = function() { return true; }; } catch (e) {}
-    try { ['log','error','warn','info','debug','trace'].forEach(m => { console[m] = noop; }); } catch (e) {}
+    try { ['log','error','warn','info','debug','trace','dir','table','assert'].forEach(m => { console[m] = noop; }); } catch (e) {}
   } catch (e) {}
 
   let step = 'init';
   try {
-    step = '1. 方法校验';
+    step = '1.方法校验';
     if (!CONFIG.SUPPORTED_METHODS.includes(req.method)) {
-      return res.status(405).json({
-        code: 405,
-        error: `不支持的请求方法，请使用${CONFIG.SUPPORTED_METHODS.join('或')}`
-      });
+      return res.status(405).json({ code: 405, error: `不支持的请求方法` });
     }
 
-    step = '2. 密码校验';
+    step = '2.密码校验';
     const isGet = req.method === 'GET';
     const { password } = isGet ? req.query : req.body;
     const expectedPassword = process.env.PASSWORD;
-
     if (password !== expectedPassword && expectedPassword) {
       return res.status(401).json({ code: 4010, error: '认证失败' });
     }
 
-    step = '3. 参数校验';
+    step = '3.参数校验';
     const params = isGet ? req.query : req.body;
     let { refresh_token, client_id, email, mailbox, response_type = 'json' } = params;
     const missingParams = CONFIG.REQUIRED_PARAMS.filter(key => !params[key]);
-
     if (missingParams.length > 0) {
-      return res.status(400).json({
-        code: 4001,
-        error: `缺少必要参数：${missingParams.join('、')}`
-      });
+      return res.status(400).json({ code: 4001, error: `缺少必要参数：${missingParams.join('、')}` });
     }
-
     const paramError = validateParams(params);
     if (paramError) {
       return res.status(400).json({ code: 4002, error: paramError.message });
     }
 
-    step = '4. Graph 探活';
-    safeLog("【开始】检查Graph API权限");
+    step = '4.Graph探活';
     const graph_api_result = await graph_api(refresh_token, client_id);
-
     let emailInfo = null;
     let graphErr = '';
 
-    step = '5. Graph 取件';
+    step = '5.Graph取件';
     if (graph_api_result.status) {
-      safeLog("【成功】Graph API权限通过");
       emailInfo = await get_dual_folder_latest_email_graph(graph_api_result.access_token);
-      if (!emailInfo) {
-        graphErr = 'Graph 取件为空';
-      }
+      if (!emailInfo) graphErr = 'Graph 取件为空';
     } else {
       graphErr = graph_api_result.error || 'Graph 权限不足';
-      safeLog("【降级】Graph 不可用：", graphErr);
     }
 
-    step = '6. IMAP 回退';
+    step = '6.IMAP回退';
     if (!emailInfo) {
-      safeLog("【降级】使用 IMAP 取件");
       try {
         const access_token = await get_access_token(refresh_token, client_id);
         const authString = generateAuthString(email, access_token);
@@ -507,7 +475,6 @@ module.exports = async (req, res) => {
         emailInfo = await get_dual_folder_latest_email_imap(imapConfig);
       } catch (imapErr) {
         const imapMsg = imapErr && imapErr.message ? imapErr.message : String(imapErr);
-        safeError('IMAP 流程异常：', imapMsg);
         return res.status(500).json({
           code: 5000,
           error: `Graph失败: ${graphErr} || IMAP失败: ${imapMsg}`
@@ -515,16 +482,12 @@ module.exports = async (req, res) => {
       }
     }
 
-    step = '7. 响应生成';
+    step = '7.响应生成';
     if (!emailInfo) {
       if (response_type === 'html') {
         return res.status(200).send(generateEmailHtml({}));
       }
-      return res.status(200).json({
-        code: 2001,
-        message: "收件箱和垃圾箱均无邮件",
-        data: null
-      });
+      return res.status(200).json({ code: 2001, message: "收件箱和垃圾箱均无邮件", data: null });
     }
 
     if (response_type === 'html') {
@@ -538,20 +501,17 @@ module.exports = async (req, res) => {
 
   } catch (error) {
     const msg = error && error.message ? error.message : String(error);
-    let statusCode = 500;
-    let errorCode = 5000;
-
-    if (msg.includes('HTTP错误！状态码：401')) {
-      statusCode = 401; errorCode = 4011;
-    } else if (msg.includes('HTTP错误！状态码：403')) {
-      statusCode = 403; errorCode = 4031;
-    } else if (msg.includes('请求超时')) {
-      statusCode = 504; errorCode = 5041;
+    // 如果错误信息里只有 "Logging is disabled"，说明业务其实跑完了，只是日志打断
+    if (msg.includes('Logging is disabled')) {
+      return res.status(500).json({
+        code: 5000,
+        error: `步骤[${step}]被日志拦截打断（Vercel 限制）`
+      });
     }
-
-    return res.status(statusCode).json({
-      code: errorCode,
-      error: `步骤[${step}]失败：${msg}`
-    });
+    let statusCode = 500, errorCode = 5000;
+    if (msg.includes('HTTP错误！状态码：401')) { statusCode = 401; errorCode = 4011; }
+    else if (msg.includes('HTTP错误！状态码：403')) { statusCode = 403; errorCode = 4031; }
+    else if (msg.includes('请求超时')) { statusCode = 504; errorCode = 5041; }
+    return res.status(statusCode).json({ code: errorCode, error: `步骤[${step}]失败：${msg}` });
   }
 };
