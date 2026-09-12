@@ -1,14 +1,37 @@
+// ========================================================================
+// 【必须在所有 require 之前】屏蔽 Vercel 日志拦截器抛出的
+// "Logging is disabled on this server" 异常
+// ========================================================================
+(function silenceLogging() {
+  const noop = () => {};
+  const noopWrite = function () { return true; };
+
+  // 1. console.* 全屏蔽
+  ['log', 'error', 'warn', 'info', 'debug', 'trace'].forEach(m => {
+    try { console[m] = noop; } catch (e) {
+      try { Object.defineProperty(console, m, { value: noop, writable: true, configurable: true }); } catch (e2) {}
+    }
+  });
+
+  // 2. 【关键】屏蔽底层 stdout / stderr —— Vercel 拦截器在这里
+  try { process.stdout.write = noopWrite; } catch (e) {}
+  try { process.stderr.write = noopWrite; } catch (e) {}
+
+  // 3. 屏蔽 process.emitWarning
+  try { process.emitWarning = noop; } catch (e) {}
+})();
+
+// ========================================================================
+
 const Imap = require('node-imap');
 const simpleParser = require("mailparser").simpleParser;
 
-// ===================== 安全日志（关键修复）=====================
-// Vercel 环境下 console.log 可能抛 "Logging is disabled on this server"
-// 全部日志调用包一层，抛错也不影响业务流程
+// ===================== 安全日志（双保险）=====================
 function safeLog(...args) {
-  try { console.log(...args); } catch (e) { /* 忽略 */ }
+  try { console.log(...args); } catch (e) {}
 }
 function safeError(...args) {
-  try { console.error(...args); } catch (e) { /* 忽略 */ }
+  try { console.error(...args); } catch (e) {}
 }
 
 // ===================== 全局配置 =====================
@@ -135,7 +158,7 @@ function extractVerifyCode(text) {
 
 function extractVerifyCodeWithLog(text, emailSubject = '未知主题') {
   const result = extractVerifyCode(text);
-  safeLog(`【6位验证码提取】邮件主题：${emailSubject} | 验证码：${result.code} | 匹配规则：${result.rule} | 置信度：${result.confidence}`);
+  safeLog(`【6位验证码提取】主题：${emailSubject} | 验证码：${result.code} | 规则：${result.rule} | 置信度：${result.confidence}`);
   return result;
 }
 
@@ -144,14 +167,14 @@ function getVerifyCodeFromEmail(emailData, emailSubject = '未知主题') {
   return extractVerifyCodeWithLog(targetText, emailSubject);
 }
 
-// ===================== 核心业务函数 =====================
+// ===================== HTML 生成 =====================
 function generateEmailHtml(emailData) {
   const { send, subject, text, html: emailHtml, date, folderSource, verifyCode } = emailData;
   const escapedText = escapeHtml(text || '');
   const escapedHtml = emailHtml || `<p>${escapedText.replace(/\n/g, '<br>')}</p>`;
   const folderCN = folderSource || '未知文件夹';
   const codeDisplay = verifyCode && verifyCode.code
-    ? `<span style="color: #e53e3e; font-weight: bold; font-size: 1.2em;">${verifyCode.code}</span>（匹配规则：${verifyCode.rule}，置信度：${verifyCode.confidence}%）`
+    ? `<span style="color: #e53e3e; font-weight: bold; font-size: 1.2em;">${verifyCode.code}</span>（规则：${verifyCode.rule}，置信度：${verifyCode.confidence}%）`
     : '未提取到6位验证码';
 
   return `
@@ -191,7 +214,8 @@ function generateEmailHtml(emailData) {
   `;
 }
 
-// ---------- 关键修复 1：IMAP token 不传 scope ----------
+// ===================== 核心业务 =====================
+// IMAP token（不传 scope，与 Go 版一致）
 async function get_access_token(refresh_token, client_id) {
   try {
     const response = await fetchWithTimeout(CONFIG.OAUTH_TOKEN_URL, {
@@ -201,7 +225,6 @@ async function get_access_token(refresh_token, client_id) {
         'client_id': client_id,
         'grant_type': 'refresh_token',
         'refresh_token': refresh_token
-        // 👆 不传 scope，交给微软按 refresh_token 原有权限处理
       }).toString()
     });
 
@@ -222,7 +245,7 @@ const generateAuthString = (user, accessToken) => {
   return Buffer.from(authString).toString('base64');
 };
 
-// ---------- 关键修复 2：Graph scope 检查同时接受 Mail.Read / Mail.ReadWrite ----------
+// Graph token 探活：与 Go 版一致 —— 同时接受 Mail.Read 和 Mail.ReadWrite
 async function graph_api(refresh_token, client_id) {
   try {
     const response = await fetchWithTimeout(CONFIG.OAUTH_TOKEN_URL, {
@@ -246,7 +269,7 @@ async function graph_api(refresh_token, client_id) {
     const scopeStr = data.scope || '';
     safeLog('Graph token scope:', scopeStr);
 
-    // 同时接受 Mail.Read 和 Mail.ReadWrite；scope 为空也放过
+    // 关键修复：同时接受 Mail.Read 和 Mail.ReadWrite；scope 为空也放过
     const hasMailPermission =
       scopeStr === '' ||
       scopeStr.indexOf('https://graph.microsoft.com/Mail.ReadWrite') !== -1 ||
@@ -258,8 +281,9 @@ async function graph_api(refresh_token, client_id) {
       error: hasMailPermission ? '' : `scope 未含 Mail 权限：${scopeStr}`
     };
   } catch (error) {
-    safeError('Graph API权限检查失败：', error && error.message ? error.message : String(error));
-    return { access_token: '', status: false, error: error && error.message ? error.message : String(error) };
+    const msg = error && error.message ? error.message : String(error);
+    safeError('Graph API权限检查失败：', msg);
+    return { access_token: '', status: false, error: msg };
   }
 }
 
@@ -410,7 +434,17 @@ async function get_dual_folder_latest_email_imap(imapConfig) {
 
 // ===================== 主入口 =====================
 module.exports = async (req, res) => {
+  // ---- 关键：运行时再屏蔽一次（防止 Vercel 在函数入口重写 process）----
   try {
+    const noop = () => {};
+    try { process.stdout.write = function() { return true; }; } catch (e) {}
+    try { process.stderr.write = function() { return true; }; } catch (e) {}
+    try { ['log','error','warn','info','debug','trace'].forEach(m => { console[m] = noop; }); } catch (e) {}
+  } catch (e) {}
+
+  let step = 'init';
+  try {
+    step = '1. 方法校验';
     if (!CONFIG.SUPPORTED_METHODS.includes(req.method)) {
       return res.status(405).json({
         code: 405,
@@ -418,17 +452,16 @@ module.exports = async (req, res) => {
       });
     }
 
+    step = '2. 密码校验';
     const isGet = req.method === 'GET';
     const { password } = isGet ? req.query : req.body;
     const expectedPassword = process.env.PASSWORD;
 
     if (password !== expectedPassword && expectedPassword) {
-      return res.status(401).json({
-        code: 4010,
-        error: '认证失败'
-      });
+      return res.status(401).json({ code: 4010, error: '认证失败' });
     }
 
+    step = '3. 参数校验';
     const params = isGet ? req.query : req.body;
     let { refresh_token, client_id, email, mailbox, response_type = 'json' } = params;
     const missingParams = CONFIG.REQUIRED_PARAMS.filter(key => !params[key]);
@@ -445,13 +478,14 @@ module.exports = async (req, res) => {
       return res.status(400).json({ code: 4002, error: paramError.message });
     }
 
+    step = '4. Graph 探活';
     safeLog("【开始】检查Graph API权限");
     const graph_api_result = await graph_api(refresh_token, client_id);
 
     let emailInfo = null;
     let graphErr = '';
 
-    // ---------- 关键修复 3：先试 Graph，失败再回退 IMAP ----------
+    step = '5. Graph 取件';
     if (graph_api_result.status) {
       safeLog("【成功】Graph API权限通过");
       emailInfo = await get_dual_folder_latest_email_graph(graph_api_result.access_token);
@@ -463,7 +497,7 @@ module.exports = async (req, res) => {
       safeLog("【降级】Graph 不可用：", graphErr);
     }
 
-    // Graph 拿不到才走 IMAP
+    step = '6. IMAP 回退';
     if (!emailInfo) {
       safeLog("【降级】使用 IMAP 取件");
       try {
@@ -474,8 +508,6 @@ module.exports = async (req, res) => {
       } catch (imapErr) {
         const imapMsg = imapErr && imapErr.message ? imapErr.message : String(imapErr);
         safeError('IMAP 流程异常：', imapMsg);
-
-        // 两边都失败：同时返回原因
         return res.status(500).json({
           code: 5000,
           error: `Graph失败: ${graphErr} || IMAP失败: ${imapMsg}`
@@ -483,7 +515,7 @@ module.exports = async (req, res) => {
       }
     }
 
-    // 无邮件
+    step = '7. 响应生成';
     if (!emailInfo) {
       if (response_type === 'html') {
         return res.status(200).send(generateEmailHtml({}));
@@ -495,7 +527,6 @@ module.exports = async (req, res) => {
       });
     }
 
-    // 有邮件
     if (response_type === 'html') {
       return res.status(200).send(generateEmailHtml(emailInfo));
     }
@@ -506,7 +537,6 @@ module.exports = async (req, res) => {
     });
 
   } catch (error) {
-    // ---------- 关键修复 4：外层 catch 不再被日志异常污染 ----------
     const msg = error && error.message ? error.message : String(error);
     let statusCode = 500;
     let errorCode = 5000;
@@ -521,7 +551,7 @@ module.exports = async (req, res) => {
 
     return res.status(statusCode).json({
       code: errorCode,
-      error: `服务器错误：${msg}`
+      error: `步骤[${step}]失败：${msg}`
     });
   }
 };
