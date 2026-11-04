@@ -246,6 +246,19 @@ async function resolveImapPath(client, folderKey) {
   return byPath ? byPath.path : fallback;
 }
 
+// imapflow 的 "Command failed" 只是外壳，真实原因在 responseStatus / responseText 里
+function describeImapError(err) {
+  if (!err) return 'unknown';
+  const parts = [];
+  parts.push(err.message || String(err));
+  if (err.responseStatus) parts.push(`command=${err.responseStatus}`);
+  if (err.serverResponseCode) parts.push(`serverCode=${err.serverResponseCode}`);
+  if (err.responseText) parts.push(`serverText=${String(err.responseText).slice(0, 300)}`);
+  if (err.authenticationFailed) parts.push('authenticationFailed=true');
+  if (err.code) parts.push(`code=${err.code}`);
+  return parts.join(' | ');
+}
+
 async function imapFetchMessages(email, accessToken, folderKey, limit) {
   const client = new ImapFlow({
     host: CONFIG.IMAP.host,
@@ -483,7 +496,7 @@ module.exports = async (req, res) => {
         const tokenData = await getAccessToken(refresh_token, client_id);
         messages = await imapFetchMessages(email, tokenData.access_token, folderKey, limit);
       } catch (err) {
-        imapError = `IMAP 通道失败：${err.message}`;
+        imapError = `IMAP 通道失败：${describeImapError(err)}`;
       }
     }
 
