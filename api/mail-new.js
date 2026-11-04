@@ -364,6 +364,19 @@ async function get_dual_folder_latest_email_graph(access_token) {
 // 【改动 3】用 imapflow 替换 node-imap
 // 参数改成 { email, accessToken }，返回 { email, error, diagnostics }
 // ========================================================================
+// imapflow 的 "Command failed" 只是外壳，真实原因在 responseStatus / responseText 里
+function describeImapError(err) {
+  if (!err) return 'unknown';
+  const parts = [];
+  parts.push(err.message || String(err));
+  if (err.responseStatus) parts.push(`command=${err.responseStatus}`);
+  if (err.serverResponseCode) parts.push(`serverCode=${err.serverResponseCode}`);
+  if (err.responseText) parts.push(`serverText=${String(err.responseText).slice(0, 300)}`);
+  if (err.authenticationFailed) parts.push('authenticationFailed=true');
+  if (err.code) parts.push(`code=${err.code}`);
+  return parts.join(' | ');
+}
+
 async function get_dual_folder_latest_email_imap({ email, accessToken }) {
   const result = {
     email: null,
@@ -439,7 +452,7 @@ async function get_dual_folder_latest_email_imap({ email, accessToken }) {
         lock.release();
       }
     } catch (err) {
-      const msg = err && err.message ? err.message : String(err);
+      const msg = describeImapError(err);
       if (!msg.includes('Logging is disabled')) {
         result.error = `IMAP收件箱失败: ${msg}`;
       }
@@ -476,7 +489,7 @@ async function get_dual_folder_latest_email_imap({ email, accessToken }) {
         lock.release();
       }
     } catch (err) {
-      const msg = err && err.message ? err.message : String(err);
+      const msg = describeImapError(err);
       if (!msg.includes('Logging is disabled') && !result.error) {
         result.error = `IMAP垃圾箱失败: ${msg}`;
       }
@@ -488,7 +501,7 @@ async function get_dual_folder_latest_email_imap({ email, accessToken }) {
     return result;
 
   } catch (err) {
-    const msg = err && err.message ? err.message : String(err);
+    const msg = describeImapError(err);
     if (!msg.includes('Logging is disabled')) {
       result.error = `IMAP连接失败: ${msg}`;
     } else {
