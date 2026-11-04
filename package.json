@@ -1,6 +1,6 @@
 {
   "engines": {
-    "node": "18.x"
+    "node": "26.x"
   },
   "dependencies": {
     "imapflow": "^1.0.164",
